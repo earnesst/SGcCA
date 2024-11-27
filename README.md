@@ -21,7 +21,7 @@ main.py: start file for model training.
 
 
 # Data availability
-All data used in this work are from public resource. The BindingDB source is at https://github.com/peizhenbai/DrugBAN, the DrugBank source is athttps://github.com/zhaoqichang/HpyerAttentionDTI, and the Human and C.elegans source is at https://github.com/masashitsubaki/CPI_prediction. 
+All data used in this work are from public resource. The BindingDB source is at https://github.com/peizhenbai/DrugBAN, the DrugBank source is at https://github.com/zhaoqichang/HpyerAttentionDTI, and the Human and C.elegans source is at https://github.com/masashitsubaki/CPI_prediction. 
  
  
 # Citation
