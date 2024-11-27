@@ -4,6 +4,47 @@ import numpy as np
 import torch
 import dgl
 import logging
+import pandas as pd
+
+CHARISOSMISET = {
+    "#": 29,
+    "%": 30,
+    ")": 31,
+    "(": 1,
+    "+": 32,
+    "-": 33,
+    "/": 34,
+    ".": 2,
+    "1": 35,
+    "0": 3,
+    "3": 36,
+    "2": 4,
+    "5": 37,
+    "4": 5,
+    "7": 38,
+    "6": 6,
+    "9": 39,
+    "8": 7,
+    "=": 40,
+    "A": 41,
+    "@": 8,
+    "C": 42,
+    "B": 9,
+    "E": 43,
+    "D": 10,
+    "G": 44,
+    "F": 11,
+    "I": 45,
+    "H": 12,
+    "K": 46,
+    "M": 47,
+    "L": 13,
+    "O": 48,
+    "N": 14,
+    "P": 15, "S": 49, "R": 16, "U": 50, "T": 17, "W": 51,
+    "V": 18, "Y": 52, "[": 53, "Z": 19, "]": 54, "\\": 20, "a": 55, "c": 56,
+"b": 21, "e": 57, "d": 22, "g": 58, "f": 23, "i": 59, "h": 24, "m": 60,
+"l": 25, "o": 61, "n": 26, "s": 62, "r": 27, "u": 63, "t": 28, "y": 64}
 
 CHARPROTSET = {
     "A": 1,
@@ -47,9 +88,9 @@ def set_seed(seed=1000):
 
 
 def graph_collate_func(x):
-    d, p, y = zip(*x)
+    d, s, p, y, drug_name, protein_name = zip(*x)
     d = dgl.batch(d)
-    return d, torch.tensor(np.array(p)), torch.tensor(y)
+    return d, torch.tensor(np.array(s)), torch.tensor(np.array(p)), torch.tensor(y), drug_name, protein_name
 
 
 def mkdir(path):
@@ -59,6 +100,24 @@ def mkdir(path):
     if not is_exists:
         os.makedirs(path)
 
+
+def integer_label_smiles(sequence, max_length=290):
+    """
+    Integer encoding for SMILES strings.
+    Args:
+        sequence (str): Protein string sequence.
+        max_length: Maximum encoding length of input protein string.
+    """
+    encoding = np.zeros(max_length)
+    for idx, letter in enumerate(sequence[:max_length]):
+        try:
+            letter = letter.upper()
+            encoding[idx] = CHARISOSMISET[letter]
+        except KeyError:
+            logging.warning(
+                f"character {letter} does not exists in sequence category encoding, skip and treat as " f"padding."
+            )
+    return encoding
 
 def integer_label_protein(sequence, max_length=1200):
     """
@@ -77,3 +136,89 @@ def integer_label_protein(sequence, max_length=1200):
                 f"character {letter} does not exists in sequence category encoding, skip and treat as " f"padding."
             )
     return encoding
+
+#药物不相关
+# def cv2(train:pd.DataFrame, test:pd.DataFrame, id=None):
+def cv2(data:pd.DataFrame):
+    data_size = len(data)
+    train, test = data[:int(data_size * 0.8)], data[int(data_size * 0.8):]
+
+    train_data = dict(SMILES=[], Protein=[], Y=[])
+
+    test_data = dict(SMILES=[], Protein=[], Y=[])
+    protein_list = train["Protein"].drop_duplicates()
+
+    for i in test.values:
+        if i[1] in protein_list.values:
+            test_data['SMILES'].append(i[0])
+            test_data['Protein'].append(i[1])
+            test_data['Y'].append((i[2]))
+
+    test = pd.DataFrame(test_data)
+    test_drug = test['SMILES'].drop_duplicates()
+    test_size = len(test)
+
+    for i in train.values:
+        if i[0] not in test_drug.values:
+            train_data['SMILES'].append(i[0])
+            train_data['Protein'].append(i[1])
+            train_data['Y'].append((i[2]))
+
+    train = pd.DataFrame(train_data)
+    val, test = test[:int(test_size * 1/3)], test[int(test_size *  1/3):]
+
+    return train, val, test
+
+#蛋白质不相关
+
+
+def cv3(data:pd.DataFrame):
+    data_size = len(data)
+    train, test = data[:int(data_size * 0.8)], data[int(data_size * 0.8):]
+
+    train_data = dict(SMILES=[], Protein=[], Y=[])
+    test_data = dict(SMILES=[], Protein=[], Y=[])
+    drug_list = train["SMILES"].drop_duplicates()
+
+    for i in test.values:
+        if i[0] in drug_list.values:
+            test_data['SMILES'].append(i[0])
+            test_data['Protein'].append(i[1])
+            test_data['Y'].append((i[2]))
+
+    test = pd.DataFrame(test_data)
+    test_protein = test['Protein'].drop_duplicates()
+    test_size = len(test)
+
+    for i in train.values:
+        if i[1] not in test_protein.values:
+            train_data['SMILES'].append(i[0])
+            train_data['Protein'].append(i[1])
+            train_data['Y'].append((i[2]))
+
+    train = pd.DataFrame(train_data)
+    val, test = test[:int(test_size * 1/3)], test[int(test_size * 1/3):]
+
+    return train, val, test
+
+#药物和蛋白质都不相关
+def cv4(data:pd.DataFrame):
+    data_size = len(data)
+    train, test = data[:int(data_size * 0.8)], data[int(data_size * 0.8):]
+
+    test_drug = test['SMILES'].drop_duplicates()
+    test_protein = test['Protein'].drop_duplicates()
+    train_data = dict(SMILES=[], Protein=[], Y=[])
+    test_size = len(test)
+    for i in train.values:
+
+        if i[0] not in test_drug.values and i[1] not in test_protein.values:
+            train_data['SMILES'].append(i[0])
+            train_data['Protein'].append(i[1])
+            train_data['Y'].append((i[2]))
+
+    train = pd.DataFrame(train_data)
+    val, test = test[:int(test_size * 1/3)], test[int(test_size * 1/3):]
+
+    return train, val, test
+

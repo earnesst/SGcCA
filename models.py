@@ -1,10 +1,12 @@
+import math
 import torch.nn as nn
 import torch.nn.functional as F
 import torch
-import math
+from einops import reduce
 from dgllife.model.gnn import GCN
-from ban import BANLayer
-from torch.nn.utils.weight_norm import weight_norm
+from dgllife.model.gnn import GAT
+from ScConv import ScConv
+from CEAA import CrossEfficientAdditiveAttnetion
 
 
 def binary_cross_entropy(pred_output, labels):
@@ -34,41 +36,96 @@ def entropy_logits(linear_output):
     return loss_ent
 
 
-class DrugBAN(nn.Module):
+class SGcADTI(nn.Module):
     def __init__(self, **config):
-        super(DrugBAN, self).__init__()
+        super(SGcADTI, self).__init__()
         drug_in_feats = config["DRUG"]["NODE_IN_FEATS"]
         drug_embedding = config["DRUG"]["NODE_IN_EMBEDDING"]
         drug_hidden_feats = config["DRUG"]["HIDDEN_LAYERS"]
         protein_emb_dim = config["PROTEIN"]["EMBEDDING_DIM"]
         num_filters = config["PROTEIN"]["NUM_FILTERS"]
-        kernel_size = config["PROTEIN"]["KERNEL_SIZE"]
+        # kernel_size = config["PROTEIN"]["KERNEL_SIZE"]
         mlp_in_dim = config["DECODER"]["IN_DIM"]
         mlp_hidden_dim = config["DECODER"]["HIDDEN_DIM"]
         mlp_out_dim = config["DECODER"]["OUT_DIM"]
         drug_padding = config["DRUG"]["PADDING"]
         protein_padding = config["PROTEIN"]["PADDING"]
         out_binary = config["DECODER"]["BINARY"]
-        ban_heads = config["BCN"]["HEADS"]
-        self.drug_extractor = MolecularGCN(in_feats=drug_in_feats, dim_embedding=drug_embedding,
-                                           padding=drug_padding,
-                                           hidden_feats=drug_hidden_feats)
-        self.protein_extractor = ProteinCNN(protein_emb_dim, num_filters, kernel_size, protein_padding)
 
-        self.bcn = weight_norm(
-            BANLayer(v_dim=drug_hidden_feats[-1], q_dim=num_filters[-1], h_dim=mlp_in_dim, h_out=ban_heads),
-            name='h_mat', dim=None)
+        self.mapd = nn.Linear(256, 128)
+        self.mapp = nn.Linear(1200, 290)
+
+        self.drug_extractor_GCN = MolecularGCN(in_feats=drug_in_feats, dim_embedding=drug_embedding,
+                                               padding=drug_padding,
+                                               hidden_feats=drug_hidden_feats)
+
+        self.drug_extractor_SMILES = MolecularScConv(protein_emb_dim, num_filters, protein_padding)
+        # self.drug_extractor_SMILES = MolecularCNN(protein_emb_dim, num_filters, kernel_size, protein_padding)
+
+        self.protein_extractor = ProteinScConv(protein_emb_dim, num_filters, protein_padding)
+        # self.protein_extractor = ProteinCNN(protein_emb_dim, num_filters, kernel_size, protein_padding)
+
+        self.ceaa = CrossEfficientAdditiveAttnetion(embed_dim=128)
+
         self.mlp_classifier = MLPDecoder(mlp_in_dim, mlp_hidden_dim, mlp_out_dim, binary=out_binary)
 
-    def forward(self, bg_d, v_p, mode="train"):
-        v_d = self.drug_extractor(bg_d)
-        v_p = self.protein_extractor(v_p)
-        f, att = self.bcn(v_d, v_p)
+    def forward(self, bg_d, smiles, v_p, mode="train"):
+        v_d = self.drug_extractor_GCN(bg_d)  # v_d.shape(64, 290, 128)
+        v_s = self.drug_extractor_SMILES(smiles)  # v_s.shape(64, 290, 128)
+        v_p = self.protein_extractor(v_p)  # v_p.shape:(64, 1200, 128)
+
+        # ceaa
+        fusion_ds = self.ceaa(v_d, v_s)
+        # fusion_ds = torch.cat([v_d, v_s], dim=-1)
+        # print(fusion_ds.shape)
+        fusion_ds = self.mapd(fusion_ds)
+        # print(fusion_ds.shape)
+        v_p = v_p.transpose(1, 2)
+        # print("v_p ", v_p .shape)
+        v_p = self.mapp(v_p)
+        # print("v_p ", v_p.shape)
+        v_p = v_p.transpose(1, 2)
+
+        f = self.ceaa(fusion_ds, v_p)
+        f = reduce(f, "B H W-> B W", "max")
+        v_s1 = reduce(v_s, "B H W-> B W", "max")
+        v_d1 = reduce(v_d, "B H W-> B W", "max")
+        v_p1 = reduce(v_p, "B H W-> B W", "max")
+        fusion_ds1 = reduce(fusion_ds, "B H W-> B W", "max")
+        vs_pooled = F.max_pool1d(v_s1, kernel_size=2)
+        vd_pooled = F.max_pool1d(v_d1, kernel_size=2)
+        vp_pooled = F.max_pool1d(v_p1, kernel_size=2)
+        fusion_ds_pooled = F.max_pool1d(fusion_ds1, kernel_size=2)
         score = self.mlp_classifier(f)
+
         if mode == "train":
-            return v_d, v_p, f, score
+            return v_d, v_p, f, score, vs_pooled, vd_pooled, vp_pooled, fusion_ds_pooled
         elif mode == "eval":
-            return v_d, v_p, score, att
+            return v_d, v_p, score, None
+
+
+import torch
+import torch.nn as nn
+from torch_geometric.nn import GATConv
+
+
+# class MolecularGAT(nn.Module):
+#     def __init__(self, in_feats, dim_embedding=128, padding=True, hidden_feats=None):
+#         super(MolecularGAT, self).__init__()
+#         self.init_transform = nn.Linear(in_feats, dim_embedding, bias=False)
+#         if padding:
+#             with torch.no_grad():
+#                 self.init_transform.weight[-1].fill_(0)
+#         self.gat = GAT(in_feats=dim_embedding, hidden_feats=hidden_feats)
+#         self.output_feats = hidden_feats[-1]
+#
+#     def forward(self, batch_graph):
+#         node_feats = batch_graph.ndata.pop('h')
+#         node_feats = self.init_transform(node_feats)
+#         node_feats = self.gat(batch_graph, node_feats)
+#         batch_size = batch_graph.batch_size
+#         node_feats = node_feats.view(batch_size, -1, self.output_feats)
+#         return node_feats
 
 
 class MolecularGCN(nn.Module):
@@ -90,29 +147,99 @@ class MolecularGCN(nn.Module):
         return node_feats
 
 
-class ProteinCNN(nn.Module):
-    def __init__(self, embedding_dim, num_filters, kernel_size, padding=True):
-        super(ProteinCNN, self).__init__()
+# 消融实验
+# class ProteinCNN(nn.Module):
+#     def __init__(self, embedding_dim, num_filters, kernel_size, padding=True):
+#         super(ProteinCNN, self).__init__()
+#         if padding:
+#             self.embedding = nn.Embedding(26, embedding_dim, padding_idx=0)
+#         else:
+#             self.embedding = nn.Embedding(26, embedding_dim)
+#         in_ch = [embedding_dim] + num_filters
+#         self.in_ch = in_ch[-1]
+#         kernels = kernel_size
+#         self.conv1 = nn.Conv1d(in_channels=in_ch[0], out_channels=in_ch[1], kernel_size=kernels[0])
+#         self.bn1 = nn.BatchNorm1d(in_ch[1])
+#         self.conv2 = nn.Conv1d(in_channels=in_ch[1], out_channels=in_ch[2], kernel_size=kernels[1])
+#         self.bn2 = nn.BatchNorm1d(in_ch[2])
+#         self.conv3 = nn.Conv1d(in_channels=in_ch[2], out_channels=in_ch[3], kernel_size=kernels[2])
+#         self.bn3 = nn.BatchNorm1d(in_ch[3])
+# 
+#     def forward(self, v):
+#         v = self.embedding(v.long())
+#         v = v.transpose(2, 1)
+#         v = self.bn1(F.relu(self.conv1(v)))
+#         v = self.bn2(F.relu(self.conv2(v)))
+#         v = self.bn3(F.relu(self.conv3(v)))
+#         v = v.view(v.size(0), v.size(2), -1)
+#         return v
+# 
+# class MolecularCNN(nn.Module):
+#     def __init__(self, embedding_dim, num_filters, kernel_size, padding=True):
+#         super(MolecularCNN, self).__init__()
+#         if padding:
+#             self.embedding = nn.Embedding(65, embedding_dim, padding_idx=0)
+#         else:
+#             self.embedding = nn.Embedding(65, embedding_dim)
+#         in_ch = [embedding_dim] + num_filters
+#         self.in_ch = in_ch[-1]
+#         kernels = kernel_size
+#         self.conv1 = nn.Conv1d(in_channels=in_ch[0], out_channels=in_ch[1], kernel_size=kernels[0], padding='same')
+#         self.bn1 = nn.BatchNorm1d(in_ch[1])
+#         self.conv2 = nn.Conv1d(in_channels=in_ch[1], out_channels=in_ch[2], kernel_size=kernels[1], padding='same')
+#         self.bn2 = nn.BatchNorm1d(in_ch[2])
+#         self.conv3 = nn.Conv1d(in_channels=in_ch[2], out_channels=in_ch[3], kernel_size=kernels[2], padding='same')
+#         self.bn3 = nn.BatchNorm1d(in_ch[3])
+# 
+#     def forward(self, v):
+#         v = self.embedding(v.long())
+#         v = v.transpose(2, 1)
+#         v = self.bn1(F.relu(self.conv1(v)))
+#         v = self.bn2(F.relu(self.conv2(v)))
+#         v = self.bn3(F.relu(self.conv3(v)))
+#         v = v.view(v.size(0), v.size(2), -1)
+#         return v
+
+class MolecularScConv(nn.Module):
+    def __init__(self, embedding_dim, num_filters, padding=True):
+        super(MolecularScConv, self).__init__()
+        if padding:
+            self.embedding = nn.Embedding(65, embedding_dim, padding_idx=0)
+        else:
+            self.embedding = nn.Embedding(65, embedding_dim)
+        in_ch = [embedding_dim] + num_filters
+        self.in_ch = in_ch[-1]
+
+        self.conv1 = ScConv(op_channel=128)
+
+    def forward(self, v):
+        v = self.embedding(v.long())
+        v = v.transpose(2, 1)
+        v = v.unsqueeze(-2)
+        v = self.conv1(v).squeeze(-2)
+        v = v.squeeze(-2)
+        v = v.view(v.size(0), v.size(2), -1)
+        return v
+
+
+class ProteinScConv(nn.Module):
+    def __init__(self, embedding_dim, num_filters, padding=True):
+        super(ProteinScConv, self).__init__()
         if padding:
             self.embedding = nn.Embedding(26, embedding_dim, padding_idx=0)
         else:
             self.embedding = nn.Embedding(26, embedding_dim)
         in_ch = [embedding_dim] + num_filters
         self.in_ch = in_ch[-1]
-        kernels = kernel_size
-        self.conv1 = nn.Conv1d(in_channels=in_ch[0], out_channels=in_ch[1], kernel_size=kernels[0])
-        self.bn1 = nn.BatchNorm1d(in_ch[1])
-        self.conv2 = nn.Conv1d(in_channels=in_ch[1], out_channels=in_ch[2], kernel_size=kernels[1])
-        self.bn2 = nn.BatchNorm1d(in_ch[2])
-        self.conv3 = nn.Conv1d(in_channels=in_ch[2], out_channels=in_ch[3], kernel_size=kernels[2])
-        self.bn3 = nn.BatchNorm1d(in_ch[3])
+        # kernels = kernel_size
+        self.conv1 = ScConv(op_channel=128)
 
     def forward(self, v):
         v = self.embedding(v.long())
         v = v.transpose(2, 1)
-        v = self.bn1(F.relu(self.conv1(v)))
-        v = self.bn2(F.relu(self.conv2(v)))
-        v = self.bn3(F.relu(self.conv3(v)))
+        v = v.unsqueeze(-2)
+        v = self.conv1(v)
+        v = v.squeeze(-2)
         v = v.view(v.size(0), v.size(2), -1)
         return v
 
@@ -136,36 +263,3 @@ class MLPDecoder(nn.Module):
         return x
 
 
-class SimpleClassifier(nn.Module):
-    def __init__(self, in_dim, hid_dim, out_dim, dropout):
-        super(SimpleClassifier, self).__init__()
-        layers = [
-            weight_norm(nn.Linear(in_dim, hid_dim), dim=None),
-            nn.ReLU(),
-            nn.Dropout(dropout, inplace=True),
-            weight_norm(nn.Linear(hid_dim, out_dim), dim=None)
-        ]
-        self.main = nn.Sequential(*layers)
-
-    def forward(self, x):
-        logits = self.main(x)
-        return logits
-
-
-class RandomLayer(nn.Module):
-    def __init__(self, input_dim_list, output_dim=256):
-        super(RandomLayer, self).__init__()
-        self.input_num = len(input_dim_list)
-        self.output_dim = output_dim
-        self.random_matrix = [torch.randn(input_dim_list[i], output_dim) for i in range(self.input_num)]
-
-    def forward(self, input_list):
-        return_list = [torch.mm(input_list[i], self.random_matrix[i]) for i in range(self.input_num)]
-        return_tensor = return_list[0] / math.pow(float(self.output_dim), 1.0 / len(return_list))
-        for single in return_list[1:]:
-            return_tensor = torch.mul(return_tensor, single)
-        return return_tensor
-
-    def cuda(self):
-        super(RandomLayer, self).cuda()
-        self.random_matrix = [val.cuda() for val in self.random_matrix]

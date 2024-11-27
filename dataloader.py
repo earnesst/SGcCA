@@ -4,7 +4,7 @@ import torch
 import numpy as np
 from functools import partial
 from dgllife.utils import smiles_to_bigraph, CanonicalAtomFeaturizer, CanonicalBondFeaturizer
-from utils import integer_label_protein
+from utils import integer_label_protein, integer_label_smiles
 
 
 class DTIDataset(data.Dataset):
@@ -34,40 +34,13 @@ class DTIDataset(data.Dataset):
         v_d.add_nodes(num_virtual_nodes, {"h": virtual_node_feat})
         v_d = v_d.add_self_loop()
 
+        v_s= self.df.iloc[index]['SMILES']
+        drug_name = self.df.iloc[index]["SMILES"]
+        v_s = integer_label_smiles(v_s)
+
         v_p = self.df.iloc[index]['Protein']
         v_p = integer_label_protein(v_p)
         y = self.df.iloc[index]["Y"]
+        protein_name = self.df.iloc[index]["Protein"]
         # y = torch.Tensor([y])
-        return v_d, v_p, y
-
-
-class MultiDataLoader(object):
-    def __init__(self, dataloaders, n_batches):
-        if n_batches <= 0:
-            raise ValueError("n_batches should be > 0")
-        self._dataloaders = dataloaders
-        self._n_batches = np.maximum(1, n_batches)
-        self._init_iterators()
-
-    def _init_iterators(self):
-        self._iterators = [iter(dl) for dl in self._dataloaders]
-
-    def _get_nexts(self):
-        def _get_next_dl_batch(di, dl):
-            try:
-                batch = next(dl)
-            except StopIteration:
-                new_dl = iter(self._dataloaders[di])
-                self._iterators[di] = new_dl
-                batch = next(new_dl)
-            return batch
-
-        return [_get_next_dl_batch(di, dl) for di, dl in enumerate(self._iterators)]
-
-    def __iter__(self):
-        for _ in range(self._n_batches):
-            yield self._get_nexts()
-        self._init_iterators()
-
-    def __len__(self):
-        return self._n_batches
+        return v_d, v_s, v_p, y, drug_name, protein_name

@@ -1,29 +1,25 @@
-comet_support = True
-try:
-    from comet_ml import Experiment
-except ImportError as e:
-    print("Comet ML is not installed, ignore the comet experiment monitor")
-    comet_support = False
-from models import DrugBAN
-from time import time
-from utils import set_seed, graph_collate_func, mkdir
-from configs import get_cfg_defaults
-from dataloader import DTIDataset, MultiDataLoader
-from torch.utils.data import DataLoader
-from trainer import Trainer
-from domain_adaptator import Discriminator
-import torch
 import argparse
-import warnings, os
+import os
+import warnings
+from datetime import datetime
+from time import time
+from utils import cv2, cv3, cv4
 import pandas as pd
+import torch
+from torch.utils.data import DataLoader
+
+from configs import get_cfg_defaults
+from dataloader import DTIDataset
+from models import SGcADTI
+from trainer import Trainer
+from utils import set_seed, graph_collate_func, mkdir
+from sklearn.utils import shuffle
+from copy import copy
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 parser = argparse.ArgumentParser(description="DrugBAN for DTI prediction")
-parser.add_argument('--cfg', required=True, help="path to config file", type=str)
-parser.add_argument('--data', required=True, type=str, metavar='TASK',
-                    help='dataset')
-parser.add_argument('--split', default='random', type=str, metavar='S', help="split task", choices=['random', 'cold', 'cluster'])
+parser.add_argument('--cfg', default=r'./configs/SGcCA.yaml', help="path to config file", type=str)
 args = parser.parse_args()
 
 
@@ -32,132 +28,109 @@ def main():
     warnings.filterwarnings("ignore", message="invalid value encountered in divide")
     cfg = get_cfg_defaults()
     cfg.merge_from_file(args.cfg)
-    set_seed(cfg.SOLVER.SEED)
-    suffix = str(int(time() * 1000))[6:]
+    cfg.RESULT.OUTPUT_DIR = f"./result/{data_name}/{cv}"
+    print(cfg.RESULT.OUTPUT_DIR)
+
     mkdir(cfg.RESULT.OUTPUT_DIR)
-    experiment = None
     print(f"Config yaml: {args.cfg}")
     print(f"Hyperparameters: {dict(cfg)}")
     print(f"Running on: {device}", end="\n\n")
 
-    dataFolder = f'./datasets/{args.data}'
-    dataFolder = os.path.join(dataFolder, str(args.split))
+    dataFolder = f'./dataset/'
 
-    if not cfg.DA.TASK:
-        train_path = os.path.join(dataFolder, 'train.csv')
-        val_path = os.path.join(dataFolder, "val.csv")
-        test_path = os.path.join(dataFolder, "test.csv")
-        df_train = pd.read_csv(train_path)
-        df_val = pd.read_csv(val_path)
-        df_test = pd.read_csv(test_path)
+    datasets_path = os.path.join(dataFolder, data_name + ".txt")
+    datasets = pd.read_csv(datasets_path, header=None, sep=' ')
+    datasets.columns = ['SMILES', 'Protein', 'Y']
 
-        train_dataset = DTIDataset(df_train.index.values, df_train)
-        val_dataset = DTIDataset(df_val.index.values, df_val)
-        test_dataset = DTIDataset(df_test.index.values, df_test)
-    else:
-        train_source_path = os.path.join(dataFolder, 'source_train.csv')
-        train_target_path = os.path.join(dataFolder, 'target_train.csv')
-        test_target_path = os.path.join(dataFolder, 'target_test.csv')
-        df_train_source = pd.read_csv(train_source_path)
-        df_train_target = pd.read_csv(train_target_path)
-        df_test_target = pd.read_csv(test_target_path)
 
-        train_dataset = DTIDataset(df_train_source.index.values, df_train_source)
-        train_target_dataset = DTIDataset(df_train_target.index.values, df_train_target)
-        test_target_dataset = DTIDataset(df_test_target.index.values, df_test_target)
+    # datasets_path = os.path.join(dataFolder, 'drugbank.csv')
+    # datasets = pd.read_csv(datasets_path)
 
-    if cfg.COMET.USE and comet_support:
-        experiment = Experiment(
-            project_name=cfg.COMET.PROJECT_NAME,
-            workspace=cfg.COMET.WORKSPACE,
-            auto_output_logging="simple",
-            log_graph=True,
-            log_code=False,
-            log_git_metadata=False,
-            log_git_patch=False,
-            auto_param_logging=False,
-            auto_metric_logging=False
-        )
-        hyper_params = {
-            "LR": cfg.SOLVER.LR,
-            "Output_dir": cfg.RESULT.OUTPUT_DIR,
-            "DA_use": cfg.DA.USE,
-            "DA_task": cfg.DA.TASK,
-        }
-        if cfg.DA.USE:
-            da_hyper_params = {
-                "DA_init_epoch": cfg.DA.INIT_EPOCH,
-                "Use_DA_entropy": cfg.DA.USE_ENTROPY,
-                "Random_layer": cfg.DA.RANDOM_LAYER,
-                "Original_random": cfg.DA.ORIGINAL_RANDOM,
-                "DA_optim_lr": cfg.SOLVER.DA_LR
-            }
-            hyper_params.update(da_hyper_params)
-        experiment.log_parameters(hyper_params)
-        if cfg.COMET.TAG is not None:
-            experiment.add_tag(cfg.COMET.TAG)
-        experiment.set_name(f"{args.data}_{suffix}")
+    metrics = {"auroc": [], "auprc": [], "accuracy": [], "precision": [], "recall": [], "f1": [], "mcc": []}
+    metrics = pd.DataFrame(metrics)
 
-    params = {'batch_size': cfg.SOLVER.BATCH_SIZE, 'shuffle': True, 'num_workers': cfg.SOLVER.NUM_WORKERS,
-              'drop_last': True, 'collate_fn': graph_collate_func}
+    for seed, fold in enumerate(range(1, 11)):
+        torch.cuda.empty_cache()
 
-    if not cfg.DA.USE:
-        training_generator = DataLoader(train_dataset, **params)
+        cv_out_path = f"./result/{data_name}/{cv}/random_{fold}"
+        os.makedirs(cv_out_path, exist_ok=True)
+
+        print("*" * 60 + str(fold) + "-random" + "*" * 60)
+        data = copy(datasets)
+        data = shuffle(data, random_state=seed + 42)
+
+
+        set_seed(cfg.SOLVER.SEED)
+        block_size = len(data) // 10
+        dataset_train, dataset_test = data[:block_size * 7], data[block_size * 7:]
+        size = len(dataset_test)
+        if cv == "cv1":
+            train_set, val_set, test_set = dataset_train, dataset_test[: int(size * 1 / 3)], dataset_test[
+                                                                                             int(size * 1 / 3):]
+        elif cv == "cv2":
+            train_set, val_set, test_set = cv2(data)
+        elif cv == "cv3":
+            train_set, val_set, test_set = cv3(data)
+        elif cv == "cv4":
+            train_set, val_set, test_set = cv4(data)
+
+        train_set.reset_index(drop=True, inplace=True)
+        val_set.reset_index(drop=True, inplace=True)
+        test_set.reset_index(drop=True, inplace=True)
+
+        print("data preprocess end !!!")
+
+        print(f"train:{len(train_set)}")
+        print(f"dev:{len(val_set)}")
+        print(f"test:{len(test_set)}")
+
+        train_dataset = DTIDataset(train_set.index.values, train_set)
+        val_dataset = DTIDataset(val_set.index.values, val_set)
+        test_dataset = DTIDataset(test_set.index.values, test_set)
+
+        model = SGcADTI(**cfg).to(device)
+        opt = torch.optim.Adam(model.parameters(), lr=cfg.SOLVER.LR)
+        torch.backends.cudnn.benchmark = True
+
+        params = {'batch_size': cfg.SOLVER.BATCH_SIZE, 'shuffle': True, 'num_workers': cfg.SOLVER.NUM_WORKERS,
+                  'drop_last': True, 'collate_fn': graph_collate_func}
+
+
+        train_generator = DataLoader(train_dataset, **params)
+
         params['shuffle'] = False
         params['drop_last'] = False
-        if not cfg.DA.TASK:
-            val_generator = DataLoader(val_dataset, **params)
-            test_generator = DataLoader(test_dataset, **params)
-        else:
-            val_generator = DataLoader(test_target_dataset, **params)
-            test_generator = DataLoader(test_target_dataset, **params)
-    else:
-        source_generator = DataLoader(train_dataset, **params)
-        target_generator = DataLoader(train_target_dataset, **params)
-        n_batches = max(len(source_generator), len(target_generator))
-        multi_generator = MultiDataLoader(dataloaders=[source_generator, target_generator], n_batches=n_batches)
-        params['shuffle'] = False
-        params['drop_last'] = False
-        val_generator = DataLoader(test_target_dataset, **params)
-        test_generator = DataLoader(test_target_dataset, **params)
 
-    model = DrugBAN(**cfg).to(device)
+        val_generator = DataLoader(val_dataset, **params)
+        test_generator = DataLoader(test_dataset, **params)
 
-    if cfg.DA.USE:
-        if cfg["DA"]["RANDOM_LAYER"]:
-            domain_dmm = Discriminator(input_size=cfg["DA"]["RANDOM_DIM"], n_class=cfg["DECODER"]["BINARY"]).to(device)
-        else:
-            domain_dmm = Discriminator(input_size=cfg["DECODER"]["IN_DIM"] * cfg["DECODER"]["BINARY"],
-                                       n_class=cfg["DECODER"]["BINARY"]).to(device)
-        # params = list(model.parameters()) + list(domain_dmm.parameters())
-        opt = torch.optim.Adam(model.parameters(), lr=cfg.SOLVER.LR)
-        opt_da = torch.optim.Adam(domain_dmm.parameters(), lr=cfg.SOLVER.DA_LR)
-    else:
-        opt = torch.optim.Adam(model.parameters(), lr=cfg.SOLVER.LR)
 
-    torch.backends.cudnn.benchmark = True
+        trainer = Trainer(model, opt, device, train_generator, val_generator, test_generator, **cfg)
 
-    if not cfg.DA.USE:
-        trainer = Trainer(model, opt, device, training_generator, val_generator, test_generator, opt_da=None,
-                          discriminator=None,
-                          experiment=experiment, **cfg)
-    else:
-        trainer = Trainer(model, opt, device, multi_generator, val_generator, test_generator, opt_da=opt_da,
-                          discriminator=domain_dmm,
-                          experiment=experiment, **cfg)
-    result = trainer.train()
 
-    with open(os.path.join(cfg.RESULT.OUTPUT_DIR, "model_architecture.txt"), "w") as wf:
-        wf.write(str(model))
+        result = trainer.train()
+        result = pd.DataFrame(result, index=[0])
 
-    print()
-    print(f"Directory for saving result: {cfg.RESULT.OUTPUT_DIR}")
+        metrics = pd.concat((metrics, result), axis=0)
+        trainer.save_result(cv_out_path)
 
-    return result
+        metrics.to_csv(os.path.join(cfg.RESULT.OUTPUT_DIR, f"result.csv"), index=False)
+        print(f"Directory for saving result: {cfg.RESULT.OUTPUT_DIR}")
+
+    return metrics
 
 
 if __name__ == '__main__':
+    print(f"start time: {datetime.now()}")
     s = time()
-    result = main()
+    DATASETS = ["drugbank"]
+    for data_name in DATASETS:
+        for cv_id in range(1, 5):
+            cv = f"cv{cv_id}"
+            print(data_name, cv)
+            result = main()
+            print(result)
+
     e = time()
-    print(f"Total running time: {round(e - s, 2)}s")
+    print(f"end time: {datetime.now()}")
+    print(f"Total running time: {round(e - s, 2)/3600}h")
