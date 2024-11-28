@@ -1,4 +1,4 @@
-# SGcCA: An End-to-End Framework for Drug-Target Interaction Prediction Based On Spatial and Channel Reconstruction Convolution and Cross-Efficient-Additive Attention
+# SGcCA: Deciphering Drug-Target Interaction Based on End-to-End Model with Spatial and Channel Reconstruction Convolution and Cross-Efficient-Additive Attention
  
 # Framework
 ![image](SGcCA.png)
